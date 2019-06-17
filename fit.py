@@ -9,6 +9,7 @@ from pylab import *
 from argparse import ArgumentParser
 import arviz as az
 import astropy.cosmology as cosmo
+from astropy.cosmology import Planck15
 import astropy.units as u
 from corner import corner
 import h5py
@@ -28,7 +29,7 @@ post.add_argument('--subset', metavar='DESIGNATOR', help='name of the attribute 
 post.add_argument('--event-begin', metavar='N', type=int, help='beginning of range of event indices to analyze')
 post.add_argument('--event-end', metavar='N', type=int, help='end of range of event indices to analyze (not inclusive)')
 post.add_argument('--livetime', metavar='T', type=float, help='live time of event range')
-post.add_argument('--nmix', metavar='N', default=6, type=int, help='number of Gaussians in GMM likelihood approx (default: %(default)s)')
+post.add_argument('--nmix', metavar='N', default=7, type=int, help='number of Gaussians in GMM likelihood approx (default: %(default)s)')
 
 sel = p.add_argument_group('Selection Function Options')
 sel.add_argument('--selfile', metavar='FILE.h5', default='selected.h5', help='file containing records of successful injections for VT estimation (default: %(default)s)')
@@ -127,6 +128,21 @@ for i in tqdm(range(nobs), desc='GMM Fitting'):
     gmm_means.append(gmm.means_)
     gmm_covs.append(gmm.covariances_)
 
+zi = expm1(linspace(log(1), log(11), 1000))
+di = Planck15.luminosity_distance(zi).to(u.Gpc).value
+z_of_d = interp1d(di, zi)
+
+mu_samp = []
+chol_cov_samp = []
+for i in tqdm(range(nobs), desc='Mean/Sigma Samples'):
+    q = chain['m2det'][i,:] / chain['m1det'][i,:]
+    pts = column_stack((log(chain['m1det'][i,:]),
+                        log(q) - log(1-q),
+                        log(chain['dl'][i,:])))
+
+    mu_samp.append(mean(pts, axis=0))
+    chol_cov_samp.append(np.linalg.cholesky(cov(pts, rowvar=False)))
+
 ninterp = 1000
 zMax = 10
 zinterp = expm1(linspace(log(1), log(zMax+1), ninterp))
@@ -144,6 +160,9 @@ d = {
     'means': gmm_means,
     'covs': gmm_covs,
 
+    'mu_samp': mu_samp,
+    'chol_cov_samp': chol_cov_samp,
+
     'm1sel': m1s_det,
     'm2sel': m2s_det,
     'dlsel': dls_det,
@@ -154,34 +173,61 @@ d = {
 
     'cosmo_prior': 1 if args.cosmo_prior else 0,
 
-    'z_p': true_params['z_p']
+    'z_p': true_params['z_p'],
+    'd_p': Planck15.luminosity_distance(true_params['z_p']).to(u.Gpc).value
 }
 
-f = m.sampling(data=d, iter=2*args.iter, thin=args.thin)
-fit = f.extract(permuted=True)
+def init(chain_index=None):
+    if args.cosmo_prior:
+        Hp = Planck15.H0.to(u.km/u.s/u.Mpc).value*Planck15.efunc(true_params['z_p'])*(1+0.01*randn())
+        Om = Planck15.Om0*(1+0.01*randn())
+    else:
+        Hp = Planck15.H0.to(u.km/u.s/u.Mpc).value*Planck15.efunc(true_params['z_p'])*(1+0.1*randn())
+        Om = Planck15.Om0*(1+0.1*randn())
+    w = -1 + 0.1*randn()
+
+    c = cosmo.FlatwCDM(Hp/Planck15.efunc(true_params['z_p']), Om, w)
+
+    MMax_d_p = (45 + 5*randn())*(1+cosmo.z_at_value(c.luminosity_distance, Planck15.luminosity_distance(true_params['z_p']).to(u.Gpc)))
+    smooth_max = 0.1 + 0.01*randn()
+    MMax_d_p_2sigma = exp(log(MMax_d_p) + 2*smooth_max)
+
+    alpha = 0.7 + 0.1*randn()
+    beta = 0.1*randn()
+    gamma = 3 + 0.1*randn()
+
+    return {
+        'H_p': Hp,
+        'Om': Om,
+        'w0': w,
+        'MMax_d_p': MMax_d_p,
+        'MMax_d_p_2sigma': MMax_d_p_2sigma,
+        'alpha': alpha,
+        'beta': beta,
+        'gamma': gamma,
+        'xs': randn(nobs, 3)
+    }
+
+f = m.sampling(data=d, iter=2*args.iter, thin=args.thin, init=init)
+fit = az.convert_to_inference_data(f)
 
 print(f)
 
 # Now that we're done with sampling, let's draw some pretty lines.
 lines = (('H0', {}, true_params['H0']),
          ('Om', {}, true_params['Om']),
-         ('w', {}, true_params['w']),
-         ('w_p', {}, true_params['w']),
-         ('w_a', {}, true_params['w_a']),
+         ('w0', {}, true_params['w']),
          ('R0_30', {}, true_params['R0_30']),
          ('MMin', {}, true_params['MMin']),
          ('MMax', {}, true_params['MMax']),
+         ('smooth_min', {}, true_params['smooth_min']),
+         ('smooth_max', {}, true_params['smooth_max']),
          ('alpha', {}, true_params['alpha']),
          ('beta', {}, true_params['beta']),
          ('gamma', {}, true_params['gamma']),
          ('neff_det', {}, 4*nobs))
 
-az.plot_trace(f, var_names=['H0', 'Om', 'w', 'w_p', 'w_a', 'R0_30', 'MMin', 'MMax', 'alpha', 'beta', 'gamma', 'neff_det'], lines=lines)
+az.plot_trace(fit, var_names=['H0', 'Om', 'w0', 'R0_30', 'MMax', 'smooth_max', 'alpha', 'beta', 'gamma', 'neff_det'], lines=lines)
 savefig(args.tracefile)
 
-with h5py.File(args.chainfile, 'w') as out:
-    out.attrs['nobs'] = nobs
-    out.attrs['nsel'] = ndet
-
-    for n in ['H0', 'Om', 'w', 'w_p', 'w_a', 'R0_30', 'MMin', 'MMax', 'alpha', 'beta', 'gamma', 'neff_det', 'm1s', 'm2s', 'dls', 'zs']:
-        out.create_dataset(n, data=fit[n], compression='gzip', shuffle=True)
+az.to_netcdf(fit, args.chainfile)
